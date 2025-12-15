@@ -40,6 +40,24 @@ docker build -t envweave-lineworld -f docker/lineworld_env_server/Dockerfile .
 uv run -m envweave.examples.train_lineworld_pg --backend docker_http --num-envs 4 --episodes 200
 ```
 
+## SWE-ish RL demo (tiny "LLM" policy)
+
+`CodeFixEnv` is a single-step "choose the correct operator to fix the code" bandit. The demo trains a **tiny transformer policy from scratch** (2-layer encoder; no pretraining).
+
+In-proc:
+
+```bash
+uv pip install -e '.[train,torch]'
+uv run -m envweave.examples.train_codefix_pg --backend inproc --num-envs 32
+```
+
+Docker/HTTP (same semantics, env runs in a container; training stays local):
+
+```bash
+docker build -t envweave-codefix -f docker/codefix_env_server/Dockerfile .
+uv run -m envweave.examples.train_codefix_pg --backend docker_http --docker-image envweave-codefix --num-envs 16
+```
+
 ## Benchmark (tinker-mxb)
 
 If you have the sibling repo `../tinker-mxb` checked out, you can run a quick vectorized throughput benchmark:
