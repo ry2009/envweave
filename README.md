@@ -68,6 +68,16 @@ export TINKER_API_KEY=...
 uv run -m envweave.examples.train_gsm8k_tinker_rl --backend inproc --num-envs 8
 ```
 
+## Real base model RL via Tinker (GSM8K-MCQ)
+
+This variant turns GSM8K into a 4-way multiple-choice env (dense reward, short outputs) which is useful for quick end-to-end RL wiring tests.
+
+```bash
+uv pip install -e '.[train,tinker]'
+export TINKER_API_KEY=...
+uv run -m envweave.examples.train_gsm8k_mcq_tinker_rl --backend inproc --num-envs 8 --episodes 800
+```
+
 Docker/HTTP env backend (same `reset()/step()` semantics):
 
 ```bash
