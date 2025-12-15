@@ -15,6 +15,7 @@ dev = ["pytest>=8.0.0"]
 bench = ["numpy>=2.0.0", "requests>=2.31.0"]
 train = ["numpy>=2.0.0", "matplotlib>=3.8.0"]
 torch = ["torch>=2.2.0"]
+tinker = ["tinker>=0.7.0"]
 # Meta-pytorch OpenEnv core utilities (HTTP client + docker helpers).
 openenv = ["openenv-core>=0.1.1", "requests>=2.31.0"]
 

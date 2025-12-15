@@ -58,6 +58,23 @@ docker build -t envweave-codefix -f docker/codefix_env_server/Dockerfile .
 uv run -m envweave.examples.train_codefix_pg --backend docker_http --docker-image envweave-codefix --num-envs 16
 ```
 
+## Real base model RL via Tinker (GSM8K)
+
+This demo uses a **real open-weight base model** (LoRA) via **Tinker** and a dataset-backed env (`GSM8KEnv`). It produces `metrics.jsonl` + `metrics.png` in `runs/`.
+
+```bash
+uv pip install -e '.[train,tinker]'
+export TINKER_API_KEY=...
+uv run -m envweave.examples.train_gsm8k_tinker_rl --backend inproc --num-envs 8
+```
+
+Docker/HTTP env backend (same `reset()/step()` semantics):
+
+```bash
+docker build -t envweave-gsm8k -f docker/gsm8k_env_server/Dockerfile .
+uv run -m envweave.examples.train_gsm8k_tinker_rl --backend docker_http --docker-image envweave-gsm8k --num-envs 8
+```
+
 ## Benchmark (tinker-mxb)
 
 If you have the sibling repo `../tinker-mxb` checked out, you can run a quick vectorized throughput benchmark:
