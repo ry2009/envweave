@@ -189,10 +189,11 @@ def main(argv: list[str] | None = None) -> int:
 
     tokenizer = AutoTokenizer.from_pretrained(str(args.base_model), trust_remote_code=True)
 
+    run_id = _utc_run_id()
     run_dir = (
         Path(args.run_dir).expanduser()
         if str(args.run_dir).strip()
-        else (Path("runs") / "gsm8k_tinker_rl" / _utc_run_id())
+        else (Path("runs") / "gsm8k_tinker_rl" / run_id)
     )
     run_dir.mkdir(parents=True, exist_ok=True)
     metrics_path = run_dir / "metrics.jsonl"
@@ -228,7 +229,8 @@ def main(argv: list[str] | None = None) -> int:
         seed=int(args.seed),
     )
 
-    sampler_path = training_client.save_weights_for_sampler("gsm8k_rl").result().path
+    sampler_name_base = f"gsm8k_rl_{run_id}"
+    sampler_path = training_client.save_weights_for_sampler(f"{sampler_name_base}_000000").result().path
     sampling_client = service.create_sampling_client(model_path=sampler_path)
 
     baseline = 0.0
@@ -325,7 +327,9 @@ def main(argv: list[str] | None = None) -> int:
             updates_done += 1
 
             if int(args.sync_every) > 0 and updates_done % int(args.sync_every) == 0:
-                sampler_path = training_client.save_weights_for_sampler("gsm8k_rl").result().path
+                sampler_path = training_client.save_weights_for_sampler(
+                    f"{sampler_name_base}_{updates_done:06d}"
+                ).result().path
                 sampling_client = service.create_sampling_client(model_path=sampler_path)
 
             for i in range(int(args.num_envs)):
