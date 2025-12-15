@@ -143,39 +143,6 @@ def _build_datum(
     )
 
 
-def _sample_one(
-    *,
-    sampling_client,
-    prompt_tokens: list[int],
-    max_tokens: int,
-    temperature: float,
-    top_p: float,
-    seed: int | None,
-):
-    from tinker import ModelInput, SamplingParams
-
-    params = SamplingParams(
-        max_tokens=int(max_tokens),
-        temperature=float(temperature),
-        top_p=float(top_p),
-        seed=int(seed) if seed is not None else None,
-    )
-    resp = sampling_client.sample(
-        ModelInput.from_ints(list(prompt_tokens)),
-        num_samples=1,
-        sampling_params=params,
-        include_prompt_logprobs=True,
-    ).result()
-    seq = resp.sequences[0]
-    prompt_logprobs = [0.0 if v is None else float(v) for v in (resp.prompt_logprobs or [])]
-    gen_logprobs = [float(v) for v in (seq.logprobs or [])]
-    return {
-        "gen_tokens": list(seq.tokens),
-        "prompt_logprobs": prompt_logprobs,
-        "gen_logprobs": gen_logprobs,
-    }
-
-
 @dataclass
 class _RunSummary:
     episodes: int
@@ -198,6 +165,7 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--backend", type=str, default="inproc", choices=["inproc", "docker_http"])
     p.add_argument("--docker-image", type=str, default="envweave-gsm8k")
     p.add_argument("--num-envs", type=int, default=8)
+    p.add_argument("--max-examples", type=int, default=256, help="limit dataset examples for faster demos")
     p.add_argument("--max-tokens", type=int, default=128)
     p.add_argument("--temperature", type=float, default=0.7)
     p.add_argument("--top-p", type=float, default=0.95)
@@ -216,7 +184,7 @@ def main(argv: list[str] | None = None) -> int:
 
     _require_env("TINKER_API_KEY")
 
-    from tinker import AdamParams, ServiceClient
+    from tinker import AdamParams, ModelInput, SamplingParams, ServiceClient
     from transformers import AutoTokenizer
 
     tokenizer = AutoTokenizer.from_pretrained(str(args.base_model), trust_remote_code=True)
@@ -232,7 +200,11 @@ def main(argv: list[str] | None = None) -> int:
     env_id = "local://gsm8k-v0"
     ew.register(
         env_id,
-        factory=lambda: ew.examples.GSM8KEnv(split="train", seed=int(args.seed)),
+        factory=lambda: ew.examples.GSM8KEnv(
+            split="train",
+            seed=int(args.seed),
+            max_examples=int(args.max_examples) if int(args.max_examples) > 0 else None,
+        ),
         docker_image=str(args.docker_image),
         observation_type=ew.examples.GSM8KObs,
         action_type=ew.examples.GSM8KAction,
@@ -279,32 +251,41 @@ def main(argv: list[str] | None = None) -> int:
                 tokenizer.encode(p, add_special_tokens=True) for p in prompts
             ]
 
-            samples = [
-                _sample_one(
-                    sampling_client=sampling_client,
-                    prompt_tokens=pt,
+            sample_futures = []
+            for i, pt in enumerate(prompt_tokens_list):
+                params = SamplingParams(
                     max_tokens=int(args.max_tokens),
                     temperature=float(args.temperature),
                     top_p=float(args.top_p),
-                    seed=int(args.seed) + episodes_done,
+                    seed=int(args.seed) + episodes_done + i,
                 )
-                for pt in prompt_tokens_list
-            ]
+                sample_futures.append(
+                    sampling_client.sample(
+                        ModelInput.from_ints(list(pt)),
+                        num_samples=1,
+                        sampling_params=params,
+                        include_prompt_logprobs=True,
+                    )
+                )
+            sample_responses = [f.result() for f in sample_futures]
 
             actions: list[dict[str, Any]] = []
             full_tokens_list: list[list[int]] = []
             prompt_len_list: list[int] = []
             sampling_logprobs_list: list[list[float]] = []
 
-            for pt, s in zip(prompt_tokens_list, samples):
-                gen_tokens = list(s["gen_tokens"])
+            for pt, resp in zip(prompt_tokens_list, sample_responses):
+                seq = resp.sequences[0]
+                gen_tokens = list(seq.tokens)
                 answer_text = tokenizer.decode(gen_tokens, skip_special_tokens=True)
                 actions.append({"answer": answer_text})
 
-                prompt_logprobs = list(s["prompt_logprobs"])
+                prompt_logprobs = [
+                    0.0 if v is None else float(v) for v in (resp.prompt_logprobs or [])
+                ]
                 if len(prompt_logprobs) != len(pt):
                     prompt_logprobs = [0.0] * len(pt)
-                gen_logprobs = list(s["gen_logprobs"])
+                gen_logprobs = [float(v) for v in (seq.logprobs or [])]
                 if len(gen_logprobs) != len(gen_tokens):
                     gen_logprobs = [0.0] * len(gen_tokens)
 
@@ -452,4 +433,3 @@ def main(argv: list[str] | None = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

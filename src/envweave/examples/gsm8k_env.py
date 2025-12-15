@@ -121,7 +121,7 @@ class GSM8KEnv:
             return self.reset(seed=seed, options=options)
 
         self._prompt = (
-            "Solve the following math word problem. Show your work.\n"
+            "Solve the following math word problem.\n"
             "Put the final numeric answer on its own line formatted exactly as:\n"
             "#### <number>\n\n"
             f"Question: {self._question}\n\nAnswer:\n"
