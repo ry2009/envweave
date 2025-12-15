@@ -171,6 +171,14 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--top-p", type=float, default=0.95)
     p.add_argument("--lr", type=float, default=1e-4)
     p.add_argument("--grad-clip", type=float, default=1.0)
+    p.add_argument(
+        "--loss-fn",
+        type=str,
+        default="ppo",
+        choices=["importance_sampling", "ppo", "cispo"],
+    )
+    p.add_argument("--clip-low-threshold", type=float, default=0.8)
+    p.add_argument("--clip-high-threshold", type=float, default=1.2)
     p.add_argument("--sync-every", type=int, default=10, help="save weights for sampler every N updates")
     p.add_argument("--episodes", type=int, default=0, help="0 => run until convergence (bounded by --max-episodes)")
     p.add_argument("--max-episodes", type=int, default=2000)
@@ -305,7 +313,13 @@ def main(argv: list[str] | None = None) -> int:
 
             mean_reward = float(sum(batch_rewards) / max(len(batch_rewards), 1))
             baseline = 0.95 * baseline + 0.05 * mean_reward
-            advantages = [float(r - baseline) for r in batch_rewards]
+
+            # Group-centered advantages (lower variance than a global EMA baseline).
+            adv_arr = np.array(batch_rewards, dtype=np.float32) - float(mean_reward)
+            std = float(np.std(adv_arr))
+            if std > 1e-6:
+                adv_arr = adv_arr / std
+            advantages = [float(x) for x in adv_arr.tolist()]
 
             data = [
                 _build_datum(
@@ -317,7 +331,18 @@ def main(argv: list[str] | None = None) -> int:
                 for i in range(int(args.num_envs))
             ]
 
-            fb = training_client.forward_backward(data, loss_fn="importance_sampling").result()
+            loss_fn_config = None
+            if str(args.loss_fn) in ("ppo", "cispo"):
+                loss_fn_config = {
+                    "clip_low_threshold": float(args.clip_low_threshold),
+                    "clip_high_threshold": float(args.clip_high_threshold),
+                }
+
+            fb = training_client.forward_backward(
+                data,
+                loss_fn=str(args.loss_fn),
+                loss_fn_config=loss_fn_config,
+            ).result()
             training_client.optim_step(
                 AdamParams(
                     learning_rate=float(args.lr),
