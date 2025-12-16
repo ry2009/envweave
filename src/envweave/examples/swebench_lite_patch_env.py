@@ -246,8 +246,6 @@ class DockerSWEbenchRunner:
                 (
                     "set -euo pipefail; "
                     "cd /testbed; "
-                    "git reset --hard >/dev/null 2>&1 || true; "
-                    "git clean -fdx >/dev/null 2>&1 || true; "
                     "if [ -s /patches/test_patch.diff ]; then git apply /patches/test_patch.diff; fi; "
                     "if [ -s /patches/model_patch.diff ]; then git apply /patches/model_patch.diff; fi; "
                     "python /patches/run_pytest.py"
