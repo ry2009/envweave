@@ -84,3 +84,21 @@ Docker/HTTP env backend (same `reset()/step()` semantics):
 docker build -t envweave-gsm8k -f docker/gsm8k_env_server/Dockerfile .
 uv run -m envweave.examples.train_gsm8k_tinker_rl --backend docker_http --docker-image envweave-gsm8k --num-envs 8
 ```
+
+## Real base model RL via Tinker (SWE-bench Lite localization MCQ)
+
+SWE-bench Lite tasks include a gold patch (typically editing a single file). This environment turns the task into
+**file-localization MCQ**: given the issue, pick which file should be edited.
+
+```bash
+uv pip install -e '.[train,tinker,swebench]'
+export TINKER_API_KEY=...
+uv run -m envweave.examples.train_swebench_lite_loc_mcq_tinker_rl --backend inproc --num-envs 8 --episodes 0 --target-success-rate 0.7
+```
+
+Docker/HTTP env backend (same semantics):
+
+```bash
+docker build -t envweave-swebench-lite-loc-mcq -f docker/swebench_lite_loc_mcq_env_server/Dockerfile .
+uv run -m envweave.examples.train_swebench_lite_loc_mcq_tinker_rl --backend docker_http --docker-image envweave-swebench-lite-loc-mcq --num-envs 8
+```

@@ -18,6 +18,8 @@ torch = ["torch>=2.2.0"]
 tinker = ["tinker>=0.7.0"]
 # Meta-pytorch OpenEnv core utilities (HTTP client + docker helpers).
 openenv = ["openenv-core>=0.1.1", "requests>=2.31.0"]
+# SWE-bench Lite dataset loader (Hugging Face datasets).
+swebench = ["datasets>=2.19.0"]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/envweave"]
