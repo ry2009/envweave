@@ -168,13 +168,17 @@ def _eval_patch(
 ) -> tuple[float, float]:
     from tinker import ModelInput, SamplingParams
 
+    vector_kwargs: dict[str, Any] = {}
+    if str(backend) == "docker_http":
+        vector_kwargs["docker_extra_args"] = list(docker_extra_args)
+
     venv = ew.make_vector(
         env_id,
         num_envs=int(num_envs),
         backend=str(backend),
         autoreset=True,
         max_workers=int(num_envs),
-        docker_extra_args=list(docker_extra_args),
+        **vector_kwargs,
     )
     rr = venv.reset(seed=int(seed))
     current_obs: list[ew.examples.SWEbenchLitePatchObs] = list(rr.obs)
@@ -336,13 +340,17 @@ def main(argv: list[str] | None = None) -> int:
     if str(args.backend) == "docker_http" and bool(args.docker_sock):
         docker_extra_args = ["-v", "/var/run/docker.sock:/var/run/docker.sock"]
 
+    vector_kwargs: dict[str, Any] = {}
+    if str(args.backend) == "docker_http":
+        vector_kwargs["docker_extra_args"] = list(docker_extra_args)
+
     venv = ew.make_vector(
         env_id,
         num_envs=int(args.num_envs),
         backend=str(args.backend),
         autoreset=True,
         max_workers=int(args.num_envs),
-        docker_extra_args=list(docker_extra_args),
+        **vector_kwargs,
     )
     rr = venv.reset(seed=int(args.seed))
     current_obs: list[ew.examples.SWEbenchLitePatchObs] = list(rr.obs)
@@ -644,4 +652,3 @@ def main(argv: list[str] | None = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
