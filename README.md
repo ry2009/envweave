@@ -84,13 +84,3 @@ Docker/HTTP env backend (same `reset()/step()` semantics):
 docker build -t envweave-gsm8k -f docker/gsm8k_env_server/Dockerfile .
 uv run -m envweave.examples.train_gsm8k_tinker_rl --backend docker_http --docker-image envweave-gsm8k --num-envs 8
 ```
-
-## Benchmark (tinker-mxb)
-
-If you have the sibling repo `../tinker-mxb` checked out, you can run a quick vectorized throughput benchmark:
-
-```bash
-uv pip install -e '.[bench]'
-uv run --env-file .env -m envweave.bench.tinker_search_env --num-envs 8 --steps 1024
-```
-This benchmark always runs fully offline (tinker-mxb’s deterministic hash embeddings).

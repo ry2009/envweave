@@ -27,7 +27,12 @@ class VectorEnv:
         self, *, seed: int | None = None, options: dict[str, Any] | None = None
     ) -> ResetBatchResult:
         futures = [
-            self._executor.submit(env.reset, seed=seed, options=options) for env in self.envs
+            self._executor.submit(
+                env.reset,
+                seed=(None if seed is None else int(seed) + i),
+                options=options,
+            )
+            for i, env in enumerate(self.envs)
         ]
         results = [f.result() for f in futures]
         return ResetBatchResult(
@@ -69,4 +74,3 @@ class VectorEnv:
                 env.close()
         finally:
             self._executor.shutdown(wait=True, cancel_futures=False)
-

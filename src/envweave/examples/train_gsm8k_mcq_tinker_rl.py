@@ -161,6 +161,90 @@ def _wrap_prompt_for_mcq(base_prompt: str) -> str:
     )
 
 
+def _eval_mcq(
+    *,
+    env_id: str,
+    backend: str,
+    num_envs: int,
+    seed: int,
+    sampling_client,
+    tokenizer,
+    max_tokens: int,
+    temperature: float,
+    top_p: float,
+    episodes: int,
+) -> tuple[float, float]:
+    from tinker import ModelInput, SamplingParams
+
+    venv = ew.make_vector(
+        env_id,
+        num_envs=int(num_envs),
+        backend=str(backend),
+        autoreset=True,
+        max_workers=int(num_envs),
+    )
+    rr = venv.reset(seed=int(seed))
+    current_obs: list[ew.examples.GSM8KMCQObs] = list(rr.obs)
+
+    total_reward = 0.0
+    total_correct = 0
+    episodes_done = 0
+    while episodes_done < int(episodes):
+        prompts = [_wrap_prompt_for_mcq(o.prompt) for o in current_obs]
+        prompt_tokens_list = [tokenizer.encode(p, add_special_tokens=True) for p in prompts]
+
+        sample_futures = []
+        for i, pt in enumerate(prompt_tokens_list):
+            params = SamplingParams(
+                max_tokens=int(max_tokens),
+                temperature=float(temperature),
+                top_p=float(top_p),
+                seed=int(seed) + episodes_done + i,
+            )
+            sample_futures.append(
+                sampling_client.sample(
+                    ModelInput.from_ints(list(pt)),
+                    num_samples=1,
+                    sampling_params=params,
+                    include_prompt_logprobs=False,
+                )
+            )
+        sample_responses = [f.result() for f in sample_futures]
+
+        actions: list[dict[str, Any]] = []
+        for pt, resp in zip(prompt_tokens_list, sample_responses):
+            del pt
+            seq = resp.sequences[0]
+            gen_tokens = list(seq.tokens)
+            gen_text = tokenizer.decode(gen_tokens, skip_special_tokens=True)
+            choice = _parse_choice_from_text(gen_text)
+            actions.append({"choice": int(choice)})
+
+        batch = venv.step(actions)
+        batch_rewards = [float(r) for r in batch.reward]  # type: ignore[arg-type]
+        batch_correct = [bool((batch.info[i] or {}).get("correct", False)) for i in range(int(num_envs))]
+
+        for i in range(int(num_envs)):
+            if episodes_done >= int(episodes):
+                break
+            total_reward += float(batch_rewards[i])
+            total_correct += 1 if bool(batch_correct[i]) else 0
+            episodes_done += 1
+
+            next_obs = batch.obs[i]
+            ar = next(
+                (r for r in batch.requests[i] if isinstance(r, AutoResetReady)), None  # type: ignore[arg-type]
+            )
+            if ar is not None:
+                next_obs = ar.initial_obs
+            current_obs[i] = next_obs
+
+    venv.close()
+    avg_reward = total_reward / max(float(episodes_done), 1.0)
+    success_rate = float(total_correct) / max(float(episodes_done), 1.0)
+    return float(avg_reward), float(success_rate)
+
+
 @dataclass
 class _RunSummary:
     episodes: int
@@ -173,6 +257,14 @@ class _RunSummary:
     metrics_png: str
     base_model: str
     lora_rank: int
+    init_sampler_model_path: str | None = None
+    final_sampler_model_path: str | None = None
+    eval_split: str | None = None
+    eval_episodes: int | None = None
+    eval_base_avg_reward: float | None = None
+    eval_base_success_rate: float | None = None
+    eval_trained_avg_reward: float | None = None
+    eval_trained_success_rate: float | None = None
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -200,6 +292,10 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--log-every", type=int, default=200)
     p.add_argument("--run-dir", type=str, default="")
     p.add_argument("--no-plot", action="store_true")
+    p.add_argument("--eval-split", type=str, default="test", choices=["train", "test", "none"])
+    p.add_argument("--eval-episodes", type=int, default=256)
+    p.add_argument("--eval-temperature", type=float, default=0.2)
+    p.add_argument("--eval-top-p", type=float, default=1.0)
     args = p.parse_args(argv)
 
     _require_env("TINKER_API_KEY")
@@ -250,9 +346,42 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     sampler_name_base = f"gsm8k_mcq_rl_{run_id}"
-    sampling_client = service.create_sampling_client(
-        model_path=training_client.save_weights_for_sampler(f"{sampler_name_base}_000000").result().path
-    )
+    init_sampler_path = training_client.save_weights_for_sampler(f"{sampler_name_base}_000000").result().path
+    sampling_client = service.create_sampling_client(model_path=init_sampler_path)
+
+    eval_env_id = "local://gsm8k-mcq-eval-v0"
+    if str(args.eval_split) in ("train", "test") and int(args.eval_episodes) > 0:
+        ew.register(
+            eval_env_id,
+            factory=lambda: ew.examples.GSM8KMCQEnv(
+                split=str(args.eval_split),
+                seed=int(args.seed) + 1337,
+                max_examples=int(args.max_examples) if int(args.max_examples) > 0 else None,
+            ),
+            docker_image=str(args.docker_image),
+            observation_type=ew.examples.GSM8KMCQObs,
+            action_type=ew.examples.GSM8KMCQAction,
+            overwrite=True,
+        )
+        base_eval_avg_reward, base_eval_success = _eval_mcq(
+            env_id=eval_env_id,
+            backend=str(args.backend),
+            num_envs=min(int(args.num_envs), 8),
+            seed=int(args.seed) + 4242,
+            sampling_client=sampling_client,
+            tokenizer=tokenizer,
+            max_tokens=int(args.max_tokens),
+            temperature=float(args.eval_temperature),
+            top_p=float(args.eval_top_p),
+            episodes=int(args.eval_episodes),
+        )
+        print(
+            f"eval(base): split={args.eval_split} episodes={args.eval_episodes} "
+            f"avg_reward={base_eval_avg_reward:.3f} success_rate={base_eval_success:.3f}"
+        )
+    else:
+        base_eval_avg_reward = None
+        base_eval_success = None
 
     baseline = 0.0
     window = max(1, int(args.window))
@@ -323,7 +452,8 @@ def main(argv: list[str] | None = None) -> int:
 
             mean_reward = float(sum(batch_rewards) / max(len(batch_rewards), 1))
             baseline = 0.95 * baseline + 0.05 * mean_reward
-            adv_arr = np.array(batch_rewards, dtype=np.float32) - float(mean_reward)
+            adv_arr = np.array(batch_rewards, dtype=np.float32) - float(baseline)
+            adv_arr = adv_arr - float(np.mean(adv_arr))
             std = float(np.std(adv_arr))
             if std > 1e-6:
                 adv_arr = adv_arr / std
@@ -418,6 +548,32 @@ def main(argv: list[str] | None = None) -> int:
     elapsed = time.perf_counter() - t0
     venv.close()
 
+    final_sampler_path = training_client.save_weights_for_sampler(
+        f"{sampler_name_base}_{updates_done:06d}_final"
+    ).result().path
+
+    if str(args.eval_split) in ("train", "test") and int(args.eval_episodes) > 0:
+        trained_sampling_client = service.create_sampling_client(model_path=final_sampler_path)
+        trained_eval_avg_reward, trained_eval_success = _eval_mcq(
+            env_id=eval_env_id,
+            backend=str(args.backend),
+            num_envs=min(int(args.num_envs), 8),
+            seed=int(args.seed) + 4242,
+            sampling_client=trained_sampling_client,
+            tokenizer=tokenizer,
+            max_tokens=int(args.max_tokens),
+            temperature=float(args.eval_temperature),
+            top_p=float(args.eval_top_p),
+            episodes=int(args.eval_episodes),
+        )
+        print(
+            f"eval(trained): split={args.eval_split} episodes={args.eval_episodes} "
+            f"avg_reward={trained_eval_avg_reward:.3f} success_rate={trained_eval_success:.3f}"
+        )
+    else:
+        trained_eval_avg_reward = None
+        trained_eval_success = None
+
     episodes: list[int] = []
     rewards: list[float] = []
     success: list[float] = []
@@ -457,6 +613,14 @@ def main(argv: list[str] | None = None) -> int:
         metrics_png=str(png_path),
         base_model=str(args.base_model),
         lora_rank=int(args.rank),
+        init_sampler_model_path=str(init_sampler_path),
+        final_sampler_model_path=str(final_sampler_path),
+        eval_split=(None if str(args.eval_split) == "none" else str(args.eval_split)),
+        eval_episodes=(None if str(args.eval_split) == "none" else int(args.eval_episodes)),
+        eval_base_avg_reward=(None if base_eval_avg_reward is None else float(base_eval_avg_reward)),
+        eval_base_success_rate=(None if base_eval_success is None else float(base_eval_success)),
+        eval_trained_avg_reward=(None if trained_eval_avg_reward is None else float(trained_eval_avg_reward)),
+        eval_trained_success_rate=(None if trained_eval_success is None else float(trained_eval_success)),
     )
     (run_dir / "summary.json").write_text(json.dumps(summary.__dict__, indent=2) + "\n", encoding="utf-8")
     print(f"done: {json.dumps(summary.__dict__)}")
