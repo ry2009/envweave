@@ -8,6 +8,11 @@ from envweave.examples.swebench_lite_loc_mcq_env import (
     SWEbenchLiteLocMCQEnv,
     SWEbenchLiteLocMCQObs,
 )
+from envweave.examples.swebench_lite_patch_env import (
+    SWEbenchLitePatchAction,
+    SWEbenchLitePatchEnv,
+    SWEbenchLitePatchObs,
+)
 
 __all__ = [
     "CounterAction",
@@ -28,4 +33,7 @@ __all__ = [
     "SWEbenchLiteLocMCQAction",
     "SWEbenchLiteLocMCQEnv",
     "SWEbenchLiteLocMCQObs",
+    "SWEbenchLitePatchAction",
+    "SWEbenchLitePatchEnv",
+    "SWEbenchLitePatchObs",
 ]

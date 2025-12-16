@@ -102,3 +102,25 @@ Docker/HTTP env backend (same semantics):
 docker build -t envweave-swebench-lite-loc-mcq -f docker/swebench_lite_loc_mcq_env_server/Dockerfile .
 uv run -m envweave.examples.train_swebench_lite_loc_mcq_tinker_rl --backend docker_http --docker-image envweave-swebench-lite-loc-mcq --num-envs 8
 ```
+
+## Real base model RL via Tinker (SWE-bench Lite patch + tests)
+
+This is the full “generate unified diff patch → run repo tests in Docker” loop using official SWE-bench instance
+images. Each episode:
+
+1) env emits an issue prompt
+2) model generates a unified diff
+3) env applies the instance `test_patch`, applies the model patch, then runs a subset of `FAIL_TO_PASS` tests
+
+```bash
+uv pip install -e '.[train,tinker,swebench]'
+export TINKER_API_KEY=...
+uv run -m envweave.examples.train_swebench_lite_patch_tinker_rl --backend inproc --num-envs 1 --episodes 0 --target-success-rate 0.5
+```
+
+Docker/HTTP env backend (same semantics; env container needs docker.sock):
+
+```bash
+docker build -t envweave-swebench-lite-patch -f docker/swebench_lite_patch_env_server/Dockerfile .
+uv run -m envweave.examples.train_swebench_lite_patch_tinker_rl --backend docker_http --docker-image envweave-swebench-lite-patch --docker-sock --num-envs 1
+```
