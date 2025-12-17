@@ -116,24 +116,41 @@ def _to_tinker_tensor(array: np.ndarray):
 
 def _build_datum(
     *,
-    full_tokens: list[int],
-    sampling_logprobs: list[float],
-    prompt_len: int,
+    prompt_tokens: list[int],
+    gen_tokens: list[int],
+    gen_logprobs: list[float],
     advantage: float,
 ):
     from tinker import Datum, ModelInput
 
-    if len(full_tokens) != len(sampling_logprobs):
-        raise ValueError("full_tokens and sampling_logprobs must have same length")
-    if prompt_len < 0 or prompt_len > len(full_tokens):
-        raise ValueError("invalid prompt_len")
+    if not prompt_tokens:
+        raise ValueError("prompt_tokens must be non-empty")
+    if len(gen_tokens) != len(gen_logprobs):
+        raise ValueError("gen_tokens and gen_logprobs must have same length")
 
-    advantages = [0.0] * int(prompt_len) + [float(advantage)] * (len(full_tokens) - int(prompt_len))
+    full_tokens = list(prompt_tokens) + list(gen_tokens)
+    if len(full_tokens) < 2:
+        raise ValueError("need at least 2 tokens to build shifted targets")
+
+    model_input_tokens = full_tokens[:-1]
+    target_tokens = full_tokens[1:]
+
+    prompt_len = len(prompt_tokens)
+    prompt_target_len = max(prompt_len - 1, 0)
+    sampling_logprobs = ([0.0] * prompt_target_len) + list(gen_logprobs)
+    advantages = ([0.0] * prompt_target_len) + ([float(advantage)] * len(gen_tokens))
+
+    if len(model_input_tokens) != len(target_tokens):
+        raise ValueError("model_input_tokens and target_tokens must have same length")
+    if len(sampling_logprobs) != len(target_tokens):
+        raise ValueError("sampling_logprobs and target_tokens must have same length")
+    if len(advantages) != len(target_tokens):
+        raise ValueError("advantages and target_tokens must have same length")
 
     return Datum(
-        model_input=ModelInput.from_ints(list(full_tokens)),
+        model_input=ModelInput.from_ints(list(model_input_tokens)),
         loss_fn_inputs={
-            "target_tokens": _to_tinker_tensor(np.array(full_tokens, dtype=np.int64)),
+            "target_tokens": _to_tinker_tensor(np.array(target_tokens, dtype=np.int64)),
             "logprobs": _to_tinker_tensor(np.array(sampling_logprobs, dtype=np.float32)),
             "advantages": _to_tinker_tensor(np.array(advantages, dtype=np.float32)),
         },
@@ -149,6 +166,12 @@ def _extract_patch(text: str) -> str:
             # Strip an optional language header like ```diff
             if "\n" in t and t.splitlines()[0].strip().lower() in ("diff", "patch"):
                 t = "\n".join(t.splitlines()[1:]).strip()
+    # Drop any leading chatter before the first diff marker.
+    import re
+
+    m = re.search(r"(?m)^(diff --git |--- )", t)
+    if m:
+        t = t[m.start() :].strip()
     return t.strip()
 
 
@@ -213,12 +236,11 @@ def _eval_patch(
             seq = resp.sequences[0]
             gen_tokens = list(seq.tokens)
             gen_text = tokenizer.decode(gen_tokens, skip_special_tokens=True)
-            patch = _extract_patch(gen_text)
-            actions.append({"patch": patch})
+            actions.append({"patch": gen_text})
 
         batch = venv.step(actions)
-        batch_rewards = [float(r) for r in batch.reward]  # type: ignore[arg-type]
         batch_correct = [bool((batch.info[i] or {}).get("correct", False)) for i in range(int(num_envs))]
+        batch_rewards = [1.0 if c else 0.0 for c in batch_correct]
 
         for i in range(int(num_envs)):
             if episodes_done >= int(episodes):
@@ -254,6 +276,8 @@ class _RunSummary:
     base_model: str
     lora_rank: int
     train_split: str
+    interrupted: bool = False
+    run_error: str | None = None
     train_instance_ids: list[str] | None = None
     eval_split: str | None = None
     eval_episodes: int | None = None
@@ -286,6 +310,28 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--eval-episodes", type=int, default=16)
     p.add_argument("--eval-temperature", type=float, default=0.2)
     p.add_argument("--eval-top-p", type=float, default=1.0)
+    p.add_argument(
+        "--train-reward",
+        type=str,
+        default="binary",
+        choices=["binary", "env"],
+        help="Reward used for policy updates: binary(correct) or env-returned shaped reward.",
+    )
+    p.add_argument(
+        "--advantage-mode",
+        type=str,
+        default="positive_only",
+        choices=["standardize", "positive_only"],
+        help="How to transform rewards into advantages before calling forward_backward.",
+    )
+    p.add_argument(
+        "--loss-fn",
+        type=str,
+        default="ppo",
+        choices=["ppo", "importance_sampling", "cispo", "dro"],
+        help="Tinker RL loss to use in forward_backward.",
+    )
+    p.add_argument("--dro-beta", type=float, default=0.05, help="DRO beta (only if --loss-fn dro)")
     p.add_argument("--lr", type=float, default=5e-5)
     p.add_argument("--grad-clip", type=float, default=1.0)
     p.add_argument("--clip-low-threshold", type=float, default=0.9)
@@ -412,187 +458,217 @@ def main(argv: list[str] | None = None) -> int:
     updates_done = 0
 
     t0 = time.perf_counter()
-    with metrics_path.open("w", encoding="utf-8") as f_metrics:
-        while True:
-            if int(args.episodes) > 0 and episodes_done >= int(args.episodes):
-                break
-            if int(args.episodes) <= 0 and episodes_done >= int(args.max_episodes):
-                break
+    interrupted = False
+    run_error: str | None = None
+    try:
+        with metrics_path.open("w", encoding="utf-8") as f_metrics:
+            while True:
+                if int(args.episodes) > 0 and episodes_done >= int(args.episodes):
+                    break
+                if int(args.episodes) <= 0 and episodes_done >= int(args.max_episodes):
+                    break
 
-            prompt_tokens_list = [tokenizer.encode(o.prompt, add_special_tokens=True) for o in current_obs]
+                prompt_tokens_list = [tokenizer.encode(o.prompt, add_special_tokens=True) for o in current_obs]
 
-            sample_futures = []
-            for i, pt in enumerate(prompt_tokens_list):
-                params = SamplingParams(
-                    max_tokens=int(args.max_tokens),
-                    temperature=float(args.temperature),
-                    top_p=float(args.top_p),
-                    seed=int(args.seed) + episodes_done + i,
-                )
-                sample_futures.append(
-                    sampling_client.sample(
-                        ModelInput.from_ints(list(pt)),
-                        num_samples=1,
-                        sampling_params=params,
-                        include_prompt_logprobs=True,
+                sample_futures = []
+                for i, pt in enumerate(prompt_tokens_list):
+                    params = SamplingParams(
+                        max_tokens=int(args.max_tokens),
+                        temperature=float(args.temperature),
+                        top_p=float(args.top_p),
+                        seed=int(args.seed) + episodes_done + i,
                     )
-                )
-            sample_responses = [f.result() for f in sample_futures]
-
-            actions: list[dict[str, Any]] = []
-            full_tokens_list: list[list[int]] = []
-            prompt_len_list: list[int] = []
-            sampling_logprobs_list: list[list[float]] = []
-
-            for pt, resp in zip(prompt_tokens_list, sample_responses):
-                seq = resp.sequences[0]
-                gen_tokens = list(seq.tokens)
-                gen_text = tokenizer.decode(gen_tokens, skip_special_tokens=True)
-                patch = _extract_patch(gen_text)
-                actions.append({"patch": patch})
-
-                prompt_logprobs = [0.0 if v is None else float(v) for v in (resp.prompt_logprobs or [])]
-                if len(prompt_logprobs) != len(pt):
-                    prompt_logprobs = [0.0] * len(pt)
-                gen_logprobs = [float(v) for v in (seq.logprobs or [])]
-                if len(gen_logprobs) != len(gen_tokens):
-                    gen_logprobs = [0.0] * len(gen_tokens)
-
-                full_tokens = list(pt) + gen_tokens
-                full_logprobs = prompt_logprobs + gen_logprobs
-
-                full_tokens_list.append(full_tokens)
-                prompt_len_list.append(len(pt))
-                sampling_logprobs_list.append(full_logprobs)
-
-            batch = venv.step(actions)
-            batch_rewards = [float(r) for r in batch.reward]  # type: ignore[arg-type]
-            batch_correct = [bool((batch.info[i] or {}).get("correct", False)) for i in range(int(args.num_envs))]
-            batch_instance_ids = [
-                str((batch.info[i] or {}).get("instance_id", "")) for i in range(int(args.num_envs))
-            ]
-
-            mean_reward = float(sum(batch_rewards) / max(len(batch_rewards), 1))
-            baseline = 0.95 * baseline + 0.05 * mean_reward
-            adv_arr = np.array(batch_rewards, dtype=np.float32) - float(baseline)
-            adv_arr = adv_arr - float(np.mean(adv_arr))
-            std = float(np.std(adv_arr))
-            if std > 1e-6:
-                adv_arr = adv_arr / std
-            advantages = [float(x) for x in adv_arr.tolist()]
-
-            data = [
-                _build_datum(
-                    full_tokens=full_tokens_list[i],
-                    sampling_logprobs=sampling_logprobs_list[i],
-                    prompt_len=prompt_len_list[i],
-                    advantage=advantages[i],
-                )
-                for i in range(int(args.num_envs))
-            ]
-
-            training_client.forward_backward(
-                data,
-                loss_fn="ppo",
-                loss_fn_config={
-                    "clip_low_threshold": float(args.clip_low_threshold),
-                    "clip_high_threshold": float(args.clip_high_threshold),
-                },
-            ).result()
-            training_client.optim_step(
-                AdamParams(
-                    learning_rate=float(args.lr),
-                    grad_clip_norm=float(args.grad_clip),
-                )
-            ).result()
-            updates_done += 1
-
-            if int(args.sync_every) > 0 and updates_done % int(args.sync_every) == 0:
-                sampling_client = service.create_sampling_client(
-                    model_path=training_client.save_weights_for_sampler(
-                        f"{sampler_name_base}_{updates_done:06d}"
-                    ).result().path
-                )
-
-            for i in range(int(args.num_envs)):
-                episodes_done += 1
-                reward = float(batch_rewards[i])
-                correct = bool(batch_correct[i])
-                rewards_window.append(reward)
-                success_window.append(1.0 if correct else 0.0)
-
-                avg_reward = sum(rewards_window) / max(len(rewards_window), 1)
-                success_rate = sum(success_window) / max(len(success_window), 1)
-                elapsed = time.perf_counter() - t0
-
-                f_metrics.write(
-                    json.dumps(
-                        {
-                            "episode": episodes_done,
-                            "reward": reward,
-                            "correct": correct,
-                            "baseline": baseline,
-                            "avg_reward": avg_reward,
-                            "success_rate": success_rate,
-                            "elapsed_s": elapsed,
-                            "instance_id": batch_instance_ids[i],
-                        }
+                    sample_futures.append(
+                        sampling_client.sample(
+                            ModelInput.from_ints(list(pt)),
+                            num_samples=1,
+                            sampling_params=params,
+                            include_prompt_logprobs=False,
+                        )
                     )
-                    + "\n"
-                )
+                sample_responses = [f.result() for f in sample_futures]
 
-                next_obs = batch.obs[i]
-                ar = next(
-                    (r for r in batch.requests[i] if isinstance(r, AutoResetReady)), None  # type: ignore[arg-type]
-                )
-                if ar is not None:
-                    next_obs = ar.initial_obs
-                current_obs[i] = next_obs
+                actions: list[dict[str, Any]] = []
+                gen_tokens_list: list[list[int]] = []
+                gen_logprobs_list: list[list[float]] = []
 
-            f_metrics.flush()
+                for pt, resp in zip(prompt_tokens_list, sample_responses):
+                    seq = resp.sequences[0]
+                    gen_tokens = list(seq.tokens)
+                    gen_text = tokenizer.decode(gen_tokens, skip_special_tokens=True)
+                    actions.append({"patch": gen_text})
 
-            if int(args.log_every) > 0 and episodes_done % int(args.log_every) == 0:
-                avg_reward = sum(rewards_window) / max(len(rewards_window), 1)
-                success_rate = sum(success_window) / max(len(success_window), 1)
-                print(
-                    f"episodes={episodes_done} avg_reward={avg_reward:.3f} "
-                    f"success_rate={success_rate:.3f} baseline={baseline:.3f} updates={updates_done}"
-                )
+                    gen_logprobs = [0.0 if v is None else float(v) for v in (seq.logprobs or [])]
+                    if len(gen_logprobs) != len(gen_tokens):
+                        gen_logprobs = [0.0] * len(gen_tokens)
 
-            if (
-                int(args.episodes) <= 0
-                and episodes_done >= int(args.min_episodes)
-                and len(success_window) >= window
-                and (sum(success_window) / len(success_window)) >= float(args.target_success_rate)
-            ):
-                break
+                    gen_tokens_list.append(list(gen_tokens))
+                    gen_logprobs_list.append(list(gen_logprobs))
 
-    elapsed = time.perf_counter() - t0
-    venv.close()
+                batch = venv.step(actions)
+                batch_env_rewards = [float(r) for r in batch.reward]  # type: ignore[arg-type]
+                batch_correct = [bool((batch.info[i] or {}).get("correct", False)) for i in range(int(args.num_envs))]
+                batch_instance_ids = [
+                    str((batch.info[i] or {}).get("instance_id", "")) for i in range(int(args.num_envs))
+                ]
 
-    final_sampler_path = training_client.save_weights_for_sampler(
-        f"{sampler_name_base}_{updates_done:06d}_final"
-    ).result().path
+                if str(args.train_reward) == "env":
+                    batch_rewards = list(batch_env_rewards)
+                else:
+                    batch_rewards = [1.0 if bool(batch_correct[i]) else 0.0 for i in range(int(args.num_envs))]
+
+                mean_reward = float(sum(batch_rewards) / max(len(batch_rewards), 1))
+                baseline = 0.95 * baseline + 0.05 * mean_reward
+                adv_arr = np.array(batch_rewards, dtype=np.float32) - float(baseline)
+                if str(args.advantage_mode) == "positive_only":
+                    adv_arr = np.maximum(adv_arr, 0.0)
+                else:
+                    adv_arr = adv_arr - float(np.mean(adv_arr))
+                    std = float(np.std(adv_arr))
+                    if std > 1e-6:
+                        adv_arr = adv_arr / std
+                advantages = [float(x) for x in adv_arr.tolist()]
+
+                data = [
+                    _build_datum(
+                        prompt_tokens=prompt_tokens_list[i],
+                        gen_tokens=gen_tokens_list[i],
+                        gen_logprobs=gen_logprobs_list[i],
+                        advantage=advantages[i],
+                    )
+                    for i in range(int(args.num_envs))
+                ]
+
+                loss_fn = str(args.loss_fn)
+                loss_cfg: dict[str, Any] = {}
+                if loss_fn in ("ppo", "cispo"):
+                    loss_cfg = {
+                        "clip_low_threshold": float(args.clip_low_threshold),
+                        "clip_high_threshold": float(args.clip_high_threshold),
+                    }
+                elif loss_fn == "dro":
+                    loss_cfg = {"beta": float(args.dro_beta)}
+
+                training_client.forward_backward(
+                    data,
+                    loss_fn=loss_fn,
+                    loss_fn_config=loss_cfg,
+                ).result()
+                training_client.optim_step(
+                    AdamParams(
+                        learning_rate=float(args.lr),
+                        grad_clip_norm=float(args.grad_clip),
+                    )
+                ).result()
+                updates_done += 1
+
+                if int(args.sync_every) > 0 and updates_done % int(args.sync_every) == 0:
+                    sampling_client = service.create_sampling_client(
+                        model_path=training_client.save_weights_for_sampler(
+                            f"{sampler_name_base}_{updates_done:06d}"
+                        ).result().path
+                    )
+
+                for i in range(int(args.num_envs)):
+                    episodes_done += 1
+                    reward = float(batch_rewards[i])
+                    correct = bool(batch_correct[i])
+                    rewards_window.append(reward)
+                    success_window.append(1.0 if correct else 0.0)
+
+                    avg_reward = sum(rewards_window) / max(len(rewards_window), 1)
+                    success_rate = sum(success_window) / max(len(success_window), 1)
+                    elapsed = time.perf_counter() - t0
+
+                    f_metrics.write(
+                        json.dumps(
+                            {
+                                "episode": episodes_done,
+                                "reward": reward,
+                                "env_reward": float(batch_env_rewards[i]),
+                                "correct": correct,
+                                "patch_format_ok": bool((batch.info[i] or {}).get("patch_format_ok", False)),
+                                "patch_applied": bool((batch.info[i] or {}).get("patch_applied", False)),
+                                "tests_ran": bool((batch.info[i] or {}).get("tests_ran", False)),
+                                "patch_similarity": float((batch.info[i] or {}).get("patch_similarity", 0.0) or 0.0),
+                                "error": str((batch.info[i] or {}).get("error", "") or "")[:200],
+                                "baseline": baseline,
+                                "avg_reward": avg_reward,
+                                "success_rate": success_rate,
+                                "elapsed_s": elapsed,
+                                "instance_id": batch_instance_ids[i],
+                            }
+                        )
+                        + "\n"
+                    )
+
+                    next_obs = batch.obs[i]
+                    ar = next(
+                        (r for r in batch.requests[i] if isinstance(r, AutoResetReady)), None  # type: ignore[arg-type]
+                    )
+                    if ar is not None:
+                        next_obs = ar.initial_obs
+                    current_obs[i] = next_obs
+
+                f_metrics.flush()
+
+                if int(args.log_every) > 0 and episodes_done % int(args.log_every) == 0:
+                    avg_reward = sum(rewards_window) / max(len(rewards_window), 1)
+                    success_rate = sum(success_window) / max(len(success_window), 1)
+                    print(
+                        f"episodes={episodes_done} avg_reward={avg_reward:.3f} "
+                        f"success_rate={success_rate:.3f} baseline={baseline:.3f} updates={updates_done}"
+                    )
+
+                if (
+                    int(args.episodes) <= 0
+                    and episodes_done >= int(args.min_episodes)
+                    and len(success_window) >= window
+                    and (sum(success_window) / len(success_window)) >= float(args.target_success_rate)
+                ):
+                    break
+    except KeyboardInterrupt:
+        interrupted = True
+        run_error = "KeyboardInterrupt"
+        print("interrupted: saving partial run artifacts...")
+    except Exception as e:
+        interrupted = True
+        run_error = f"{type(e).__name__}: {e}"
+        print(f"error: {run_error}; saving partial run artifacts...")
+    finally:
+        elapsed = time.perf_counter() - t0
+        venv.close()
+
+    final_sampler_path: str | None = None
+    try:
+        final_sampler_path = training_client.save_weights_for_sampler(
+            f"{sampler_name_base}_{updates_done:06d}_final"
+        ).result().path
+    except Exception:
+        final_sampler_path = None
 
     if str(args.eval_split) in ("dev", "test") and int(args.eval_episodes) > 0:
-        trained_sampling_client = service.create_sampling_client(model_path=final_sampler_path)
-        trained_eval_avg_reward, trained_eval_success = _eval_patch(
-            env_id=eval_env_id,
-            backend=str(args.backend),
-            docker_extra_args=list(docker_extra_args),
-            num_envs=min(int(args.num_envs), 2),
-            seed=int(args.seed) + 4242,
-            sampling_client=trained_sampling_client,
-            tokenizer=tokenizer,
-            max_tokens=int(args.max_tokens),
-            temperature=float(args.eval_temperature),
-            top_p=float(args.eval_top_p),
-            episodes=int(args.eval_episodes),
-        )
-        print(
-            f"eval(trained): split={args.eval_split} episodes={args.eval_episodes} "
-            f"avg_reward={trained_eval_avg_reward:.3f} success_rate={trained_eval_success:.3f}"
-        )
+        if final_sampler_path is not None:
+            trained_sampling_client = service.create_sampling_client(model_path=final_sampler_path)
+            trained_eval_avg_reward, trained_eval_success = _eval_patch(
+                env_id=eval_env_id,
+                backend=str(args.backend),
+                docker_extra_args=list(docker_extra_args),
+                num_envs=min(int(args.num_envs), 2),
+                seed=int(args.seed) + 4242,
+                sampling_client=trained_sampling_client,
+                tokenizer=tokenizer,
+                max_tokens=int(args.max_tokens),
+                temperature=float(args.eval_temperature),
+                top_p=float(args.eval_top_p),
+                episodes=int(args.eval_episodes),
+            )
+            print(
+                f"eval(trained): split={args.eval_split} episodes={args.eval_episodes} "
+                f"avg_reward={trained_eval_avg_reward:.3f} success_rate={trained_eval_success:.3f}"
+            )
+        else:
+            trained_eval_avg_reward, trained_eval_success = None, None
     else:
         trained_eval_avg_reward = None
         trained_eval_success = None
@@ -637,6 +713,8 @@ def main(argv: list[str] | None = None) -> int:
         base_model=str(args.base_model),
         lora_rank=int(args.rank),
         train_split=str(args.train_split),
+        interrupted=bool(interrupted),
+        run_error=run_error,
         train_instance_ids=(instance_ids or None),
         eval_split=(None if str(args.eval_split) == "none" else str(args.eval_split)),
         eval_episodes=(None if str(args.eval_split) == "none" else int(args.eval_episodes)),
@@ -646,8 +724,9 @@ def main(argv: list[str] | None = None) -> int:
         eval_trained_success_rate=(None if trained_eval_success is None else float(trained_eval_success)),
     )
     (run_dir / "summary.json").write_text(json.dumps(summary.__dict__, indent=2) + "\n", encoding="utf-8")
-    print(f"done: {json.dumps(summary.__dict__)}")
-    return 0
+    status = "done" if not interrupted else "done_partial"
+    print(f"{status}: {json.dumps(summary.__dict__)}")
+    return 0 if not interrupted else 1
 
 
 if __name__ == "__main__":

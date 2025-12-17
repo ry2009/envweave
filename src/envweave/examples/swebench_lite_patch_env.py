@@ -39,6 +39,9 @@ class SWEbenchEvalResult:
     stdout: str = ""
     stderr: str = ""
     error: str | None = None
+    test_patch_applied: bool = True
+    model_patch_applied: bool = False
+    tests_ran: bool = False
 
 
 class SWEbenchRunner(Protocol):
@@ -115,6 +118,298 @@ def _json_list(value: Any) -> list[str]:
                 return []
         return [s]
     return [str(value)]
+
+
+def _patch_targets(patch_text: str) -> list[str]:
+    targets: list[str] = []
+    t = str(patch_text or "")
+    for line in t.splitlines():
+        line = line.strip("\n")
+        if line.startswith("diff --git "):
+            parts = line.split()
+            if len(parts) >= 4:
+                a_path = parts[2].removeprefix("a/").strip()
+                b_path = parts[3].removeprefix("b/").strip()
+                for p in (a_path, b_path):
+                    if p and p not in targets:
+                        targets.append(p)
+        elif line.startswith("--- "):
+            p = line.split(maxsplit=1)[1].strip()
+            p = p.removeprefix("a/").removeprefix("b/").strip()
+            if p and p != "/dev/null" and p not in targets:
+                targets.append(p)
+        elif line.startswith("+++ "):
+            p = line.split(maxsplit=1)[1].strip()
+            p = p.removeprefix("a/").removeprefix("b/").strip()
+            if p and p != "/dev/null" and p not in targets:
+                targets.append(p)
+    return targets
+
+
+def _patch_context_snippets(patch_text: str, *, max_lines: int = 80) -> dict[str, str]:
+    """
+    Extracts a small amount of "pre-fix" code context per file from a unified diff.
+
+    Returns mapping: file_path -> snippet (no +/- prefixes).
+    """
+
+    snippets: dict[str, list[str]] = {}
+    current_file: str | None = None
+    in_hunk = False
+
+    for raw in str(patch_text or "").splitlines():
+        line = raw.rstrip("\n")
+        if line.startswith("diff --git "):
+            in_hunk = False
+            parts = line.split()
+            if len(parts) >= 3:
+                current_file = parts[2].removeprefix("a/").strip() or None
+            else:
+                current_file = None
+            continue
+        if line.startswith("@@"):
+            in_hunk = True
+            continue
+        if not in_hunk or not current_file:
+            continue
+        if line.startswith(("--- ", "+++ ")):
+            continue
+        if line.startswith(" "):
+            snippets.setdefault(current_file, [])
+            if len(snippets[current_file]) < int(max_lines):
+                snippets[current_file].append(line[1:])
+        elif line.startswith("-"):
+            snippets.setdefault(current_file, [])
+            if len(snippets[current_file]) < int(max_lines):
+                snippets[current_file].append(line[1:])
+
+    out: dict[str, str] = {}
+    for k, v in snippets.items():
+        joined = "\n".join(v).rstrip()
+        if joined.strip():
+            out[k] = joined
+    return out
+
+
+def _looks_like_unified_diff(patch_text: str) -> bool:
+    t = str(patch_text or "").strip()
+    if not t:
+        return False
+    has_header = any(
+        line.startswith(("diff --git ", "--- ", "+++ ", "@@"))
+        for line in t.splitlines()
+    )
+    has_file_markers = ("--- " in t) and ("+++ " in t)
+    return bool(has_header and has_file_markers)
+
+
+def _extract_patch_text(text: str) -> str:
+    t = str(text or "").strip()
+    if "```" in t:
+        parts = t.split("```")
+        if len(parts) >= 3:
+            t = parts[1].strip()
+            # Strip an optional language header like ```diff
+            if "\n" in t and t.splitlines()[0].strip().lower() in ("diff", "patch"):
+                t = "\n".join(t.splitlines()[1:]).strip()
+
+    # Drop any leading chatter before the first diff marker.
+    m = re.search(r"(?m)^(diff --git |--- )", t)
+    if m:
+        t = t[m.start() :].strip()
+
+    # Truncate at the first non-diff-looking line after we have started a diff block.
+    allowed_prefixes = (
+        "diff --git ",
+        "index ",
+        "--- ",
+        "+++ ",
+        "@@",
+        "new file mode ",
+        "deleted file mode ",
+        "similarity index ",
+        "rename from ",
+        "rename to ",
+        "old mode ",
+        "new mode ",
+        "copy from ",
+        "copy to ",
+    )
+    kept: list[str] = []
+    for line in t.splitlines():
+        if not line:
+            kept.append(line)
+            continue
+        if line.startswith(allowed_prefixes) or line[0] in (" ", "+", "-", "\\"):
+            kept.append(line)
+            continue
+        break
+
+    return "\n".join(kept).strip()
+
+
+def _patch_similarity(candidate_patch: str, gold_patch: str) -> float:
+    """
+    A lightweight, line-level similarity score in [0,1] to reduce reward sparsity.
+
+    It compares added lines, removed lines, and target paths (F1 per category).
+    """
+
+    def line_sets(p: str) -> tuple[set[str], set[str], set[str]]:
+        adds: set[str] = set()
+        dels: set[str] = set()
+        for ln in str(p or "").splitlines():
+            if ln.startswith("+++ ") or ln.startswith("--- "):
+                continue
+            if ln.startswith("+"):
+                adds.add(ln[1:].strip())
+            elif ln.startswith("-"):
+                dels.add(ln[1:].strip())
+        paths = set(_patch_targets(p))
+        return adds, dels, paths
+
+    def f1(a: set[str], b: set[str]) -> float:
+        if not a and not b:
+            return 1.0
+        if not a or not b:
+            return 0.0
+        inter = len(a & b)
+        return float(2 * inter) / float(len(a) + len(b))
+
+    c_add, c_del, c_paths = line_sets(candidate_patch)
+    g_add, g_del, g_paths = line_sets(gold_patch)
+    score = (f1(c_add, g_add) + f1(c_del, g_del) + f1(c_paths, g_paths)) / 3.0
+    return float(max(0.0, min(1.0, score)))
+
+
+def _rewrite_patch_paths(patch_text: str, *, canonical_paths: list[str]) -> str:
+    """
+    Rewrites diff header paths to match known canonical paths when the patch references
+    a common suffix (e.g., `_pytest/...` vs `src/_pytest/...`).
+    """
+
+    canon = [p.strip().lstrip("/") for p in (canonical_paths or []) if str(p).strip()]
+    if not canon:
+        return str(patch_text or "")
+
+    # Map from common alternative -> canonical.
+    mapping: dict[str, str] = {}
+    for p in canon:
+        mapping[p] = p
+        if p.startswith("src/"):
+            mapping[p.removeprefix("src/")] = p
+        if p.startswith("./"):
+            mapping[p.removeprefix("./")] = p
+
+    out_lines: list[str] = []
+    for raw in str(patch_text or "").splitlines():
+        line = raw.rstrip("\n")
+        if line.startswith("diff --git "):
+            parts = line.split()
+            if len(parts) >= 4:
+                a = parts[2].removeprefix("a/").strip()
+                b = parts[3].removeprefix("b/").strip()
+                a2 = mapping.get(a, a)
+                b2 = mapping.get(b, b)
+                out_lines.append(f"diff --git a/{a2} b/{b2}")
+                continue
+        if line.startswith("--- "):
+            parts = line.split(maxsplit=1)
+            if len(parts) < 2:
+                out_lines.append(line)
+                continue
+            p = parts[1].strip()
+            prefix = ""
+            if p.startswith(("a/", "b/")):
+                prefix = p[:2]
+                p = p[2:]
+            p2 = mapping.get(p, p)
+            out_lines.append(f"--- {prefix}{p2}".rstrip())
+            continue
+        if line.startswith("+++ "):
+            parts = line.split(maxsplit=1)
+            if len(parts) < 2:
+                out_lines.append(line)
+                continue
+            p = parts[1].strip()
+            prefix = ""
+            if p.startswith(("a/", "b/")):
+                prefix = p[:2]
+                p = p[2:]
+            p2 = mapping.get(p, p)
+            out_lines.append(f"+++ {prefix}{p2}".rstrip())
+            continue
+        out_lines.append(line)
+    return "\n".join(out_lines).strip() + ("\n" if str(patch_text or "").endswith("\n") else "")
+
+
+_HUNK_HEADER_RE = re.compile(
+    r"^@@\s+-(?P<a0>\d+)(?:,(?P<a1>\d+))?\s+\+(?P<b0>\d+)(?:,(?P<b1>\d+))?\s+@@(?P<tail>.*)$"
+)
+
+
+def _fix_hunk_headers(patch_text: str) -> str:
+    """
+    Fixes unified-diff hunk header line counts to match the hunk body.
+
+    LLMs often produce correct diff bodies but incorrect `@@ -a,b +c,d @@` counts,
+    which makes `git apply` reject with "corrupt patch".
+    """
+
+    lines = str(patch_text or "").splitlines()
+    if not lines:
+        return ""
+
+    out: list[str] = []
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        m = _HUNK_HEADER_RE.match(line)
+        if not m:
+            out.append(line)
+            i += 1
+            continue
+
+        a0 = int(m.group("a0"))
+        b0 = int(m.group("b0"))
+        tail = m.group("tail") or ""
+
+        # Count lines until next hunk or next file diff.
+        orig = 0
+        new = 0
+        j = i + 1
+        while j < len(lines):
+            ln = lines[j]
+            if _HUNK_HEADER_RE.match(ln):
+                break
+            if ln.startswith("diff --git "):
+                break
+            if ln.startswith("--- ") or ln.startswith("+++ "):
+                break
+
+            if not ln:
+                orig += 1
+                new += 1
+            elif ln.startswith("+") and not ln.startswith("+++ "):
+                new += 1
+            elif ln.startswith("-") and not ln.startswith("--- "):
+                orig += 1
+            elif ln.startswith(" "):
+                orig += 1
+                new += 1
+            elif ln.startswith("\\"):
+                # "\ No newline at end of file" does not count towards either side.
+                pass
+            else:
+                # Unknown line type: keep it but stop counting further to avoid corruption.
+                break
+            j += 1
+
+        out.append(f"@@ -{a0},{orig} +{b0},{new} @@{tail}")
+        out.extend(lines[i + 1 : j])
+        i = j
+
+    return "\n".join(out).strip()
 
 
 def _docker_arch() -> str:
@@ -246,8 +541,14 @@ class DockerSWEbenchRunner:
                 (
                     "set -euo pipefail; "
                     "cd /testbed; "
-                    "if [ -s /patches/test_patch.diff ]; then git apply /patches/test_patch.diff; fi; "
-                    "if [ -s /patches/model_patch.diff ]; then git apply /patches/model_patch.diff; fi; "
+                    "if [ -s /patches/test_patch.diff ]; then "
+                    "  if ! git apply /patches/test_patch.diff; then echo ENVWEAVE_TEST_PATCH_APPLY_FAILED; exit 44; fi; "
+                    "fi; "
+                    "if [ -s /patches/model_patch.diff ]; then "
+                    "  if git apply /patches/model_patch.diff; then echo ENVWEAVE_MODEL_PATCH_APPLIED; "
+                    "  else echo ENVWEAVE_MODEL_PATCH_APPLY_FAILED; exit 42; fi; "
+                    "else echo ENVWEAVE_MODEL_PATCH_EMPTY; exit 43; "
+                    "fi; "
                     "python /patches/run_pytest.py"
                 ),
             ]
@@ -277,7 +578,11 @@ class DockerSWEbenchRunner:
         duration = time.perf_counter() - t0
         stdout = proc.stdout or ""
         stderr = proc.stderr or ""
-        ok = proc.returncode == 0
+        rc = int(proc.returncode)
+        ok = rc == 0
+        model_patch_applied = "ENVWEAVE_MODEL_PATCH_APPLIED" in stdout
+        test_patch_applied = "ENVWEAVE_TEST_PATCH_APPLY_FAILED" not in stdout and rc != 44
+        tests_ran = rc not in (42, 43, 44)
 
         passed = 0
         failed = 0
@@ -300,9 +605,16 @@ class DockerSWEbenchRunner:
 
         err: str | None = None
         if not ok:
-            # Keep it short but informative.
-            tail = (stderr or stdout).strip().splitlines()[-8:]
-            err = "pytest_failed: " + (" | ".join(tail)[:800] if tail else "unknown")
+            tail = (stderr or stdout).strip().splitlines()[-10:]
+            tail_s = (" | ".join(tail)[:800] if tail else "unknown")
+            if rc == 42:
+                err = "patch_apply_failed: " + tail_s
+            elif rc == 43:
+                err = "empty_patch"
+            elif rc == 44:
+                err = "test_patch_apply_failed: " + tail_s
+            else:
+                err = "pytest_failed: " + tail_s
 
         return SWEbenchEvalResult(
             ok=bool(ok),
@@ -314,6 +626,9 @@ class DockerSWEbenchRunner:
             stdout=stdout[-8000:],
             stderr=stderr[-8000:],
             error=err,
+            test_patch_applied=bool(test_patch_applied),
+            model_patch_applied=bool(model_patch_applied),
+            tests_ran=bool(tests_ran),
         )
 
 
@@ -401,17 +716,71 @@ class SWEbenchLitePatchEnv:
         row = self._rng.choice(self._rows)
         self._row = row
 
-        prompt = (
-            "You are solving a SWE-bench Lite GitHub issue.\n"
-            "Return ONLY a unified diff patch (no markdown code fences, no explanation).\n"
-            "The patch MUST apply cleanly with `git apply`.\n\n"
-            f"Repo: {row['repo']}\n"
-            f"Instance: {row['instance_id']}\n"
-            f"Base commit: {row['base_commit']}\n\n"
-            "Issue:\n"
-            f"{row['problem_statement']}\n\n"
-            "Patch:\n"
+        fail_to_pass = list(row.get("fail_to_pass") or [])
+        targets = _patch_targets(str(row.get("patch", "") or ""))
+        snippets = _patch_context_snippets(str(row.get("patch", "") or ""), max_lines=60)
+
+        extra_hints = ""
+        if str(row.get("repo", "")).strip().lower() == "pytest-dev/pytest":
+            extra_hints = (
+                "\nHint: In this repo, internal modules live under `src/`.\n"
+                "If a traceback mentions `_pytest/...`, the file in the repo is usually `src/_pytest/...`.\n"
+            )
+
+        issue_text = str(row.get("problem_statement", "") or "").strip()
+        if len(issue_text) > 2400:
+            clipped = issue_text[:2400]
+            if "\n" in clipped:
+                clipped = clipped.rsplit("\n", 1)[0]
+            issue_text = clipped.rstrip() + "\n...(truncated)"
+
+        prompt_parts: list[str] = [
+            "You are solving a SWE-bench Lite GitHub issue.",
+            "Return ONLY a unified diff patch (no markdown code fences, no explanation).",
+            "The patch MUST apply cleanly with `git apply`.",
+            "Goal: make the failing test(s) pass with minimal changes.",
+            "",
+            f"Repo: {row['repo']}",
+            f"Instance: {row['instance_id']}",
+            f"Base commit: {row['base_commit']}",
+            "",
+        ]
+        if fail_to_pass:
+            prompt_parts.extend(
+                [
+                    "Failing test(s) to fix:",
+                    *[f"- {t}" for t in fail_to_pass[:8]],
+                    "",
+                ]
+            )
+        if targets:
+            prompt_parts.extend(
+                [
+                    "Likely relevant file(s):",
+                    *[f"- {t}" for t in targets[:8]],
+                    "",
+                ]
+            )
+        if snippets:
+            prompt_parts.append("Relevant pre-fix code context (snippets):")
+            for path, snip in list(snippets.items())[:3]:
+                if not snip.strip():
+                    continue
+                prompt_parts.append(f"\n# {path}\n{snip}\n")
+            prompt_parts.append("")
+        if extra_hints:
+            prompt_parts.append(extra_hints.strip())
+            prompt_parts.append("")
+        prompt_parts.extend(
+            [
+                "Issue:",
+                issue_text,
+                "",
+                "Patch:",
+                "",
+            ]
         )
+        prompt = "\n".join(prompt_parts).strip() + "\n"
         return ResetResult(
             obs=SWEbenchLitePatchObs(
                 prompt=prompt,
@@ -427,7 +796,10 @@ class SWEbenchLitePatchEnv:
         if self._row is None:
             raise RuntimeError("step() called before reset()")
 
-        patch_text = self._parse_patch(action)
+        patch_text = _extract_patch_text(self._parse_patch(action))
+        canonical_paths = _patch_targets(str(self._row.get("patch", "") or ""))
+        patch_text = _rewrite_patch_paths(patch_text, canonical_paths=canonical_paths)
+        patch_text = _fix_hunk_headers(patch_text)
         self._t += 1
 
         tests = list(self._row.get("fail_to_pass") or [])
@@ -442,7 +814,17 @@ class SWEbenchLitePatchEnv:
             timeout_s=float(self._timeout_s),
         )
 
-        reward = 1.0 if bool(result.ok) else -1.0
+        patch_format_ok = _looks_like_unified_diff(patch_text)
+        gold_patch = str(self._row.get("patch", "") or "")
+        patch_similarity = _patch_similarity(patch_text, gold_patch) if patch_format_ok else 0.0
+
+        if bool(result.ok):
+            reward = 1.0
+        else:
+            reward = 0.0
+            reward += 0.2 if bool(result.model_patch_applied) else 0.0
+            reward += 0.1 * float(patch_similarity)
+            reward = max(0.0, min(0.9, float(reward)))
         info = {
             "terminated": True,
             "truncated": False,
@@ -457,6 +839,10 @@ class SWEbenchLitePatchEnv:
             "duration_s": float(result.duration_s),
             "image": str(result.image),
             "error": result.error,
+            "patch_format_ok": bool(patch_format_ok),
+            "patch_applied": bool(result.model_patch_applied),
+            "tests_ran": bool(result.tests_ran),
+            "patch_similarity": float(patch_similarity),
         }
         return StepResult(
             obs=SWEbenchLitePatchObs(

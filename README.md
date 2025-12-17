@@ -111,11 +111,25 @@ images. Each episode:
 1) env emits an issue prompt
 2) model generates a unified diff
 3) env applies the instance `test_patch`, applies the model patch, then runs a subset of `FAIL_TO_PASS` tests
+4) reward is shaped to reduce sparsity (pass/fail + patch-apply + light similarity-to-gold shaping)
 
 ```bash
 uv pip install -e '.[train,tinker,swebench]'
 export TINKER_API_KEY=...
 uv run -m envweave.examples.train_swebench_lite_patch_tinker_rl --backend inproc --num-envs 1 --episodes 0 --target-success-rate 0.5
+```
+
+Known-good “it actually converges” command (fast single-instance demo; ~10–20 min depending on machine):
+
+```bash
+uv run -m envweave.examples.train_swebench_lite_patch_tinker_rl \
+  --backend inproc \
+  --train-split test \
+  --instance-ids pytest-dev__pytest-11143 \
+  --max-examples 1 --max-fail-tests 1 --env-timeout-s 300 \
+  --num-envs 4 --episodes 240 \
+  --max-tokens 256 --temperature 0.7 --top-p 0.95 \
+  --rank 8 --lr 2e-5 --sync-every 5
 ```
 
 Docker/HTTP env backend (same semantics; env container needs docker.sock):
