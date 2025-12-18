@@ -7,6 +7,23 @@
 - Treats **vectorization** and **multi-agent** outputs as first-class.
 - Returns a **request/event stream** (`StepResult.requests`) to handle episode boundaries and turn-taking cleanly.
 
+## Install
+
+From PyPI (after you publish a release):
+
+```bash
+uv pip install envweave
+# or: pip install envweave
+```
+
+From source:
+
+```bash
+git clone https://github.com/ry2009/envweave.git
+cd envweave
+uv pip install -e '.[dev]'
+```
+
 ## Quickstart
 
 ```bash
@@ -117,6 +134,14 @@ images. Each episode:
 uv pip install -e '.[train,tinker,swebench]'
 export TINKER_API_KEY=...
 uv run -m envweave.examples.train_swebench_lite_patch_tinker_rl --backend inproc --num-envs 1 --episodes 0 --target-success-rate 0.5
+```
+
+## Publish to PyPI
+
+```bash
+uv build
+export UV_PUBLISH_TOKEN=...  # PyPI API token (don’t commit this)
+uv publish
 ```
 
 Known-good “it actually converges” command (fast single-instance demo; ~10–20 min depending on machine):
